@@ -1,6 +1,6 @@
 {
-  "installCommand": "cd backend && npm install && cd ../frontend && npm install",
-  "buildCommand": "cd frontend && npm run build",
+  "installCommand": "if [ -d \"backend\" ]; then npm install --prefix backend && npm install --prefix frontend; else npm install; fi",
+  "buildCommand": "if [ -d \"frontend\" ]; then npm run build --prefix frontend; else npm run build; fi",
   "outputDirectory": "frontend/dist",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api" },
