@@ -1,6 +1,6 @@
 {
-  "installCommand": "npm install --include=dev && cd frontend && npm install --include=dev",
-  "buildCommand": "cd frontend && npm run build && cd .. && mkdir -p dist && cp -R frontend/dist/. dist/",
+  "installCommand": "npm install --include=dev",
+  "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api" },
