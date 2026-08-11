@@ -48,8 +48,95 @@ function getKeywords(msg) {
 // Make sure to install: npm install @google/generative-ai
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+// ============================================================
+// IMAGE LANDMARK IDENTIFICATION HELPER
+// Calls Gemini Vision to identify the actual place in an image
+// BEFORE generating any tourism response.
+// ============================================================
+async function identifyLandmarkFromImage(genAI, imageBase64, mimeType, userHint = '') {
+    // Strip the data URL prefix if present (e.g. "data:image/jpeg;base64,...")
+    const base64Data = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
+    const resolvedMime = mimeType || 'image/jpeg';
+
+    // Guard: if the image is too large (>4MB base64 = ~3MB raw), skip to avoid API errors
+    if (base64Data.length > 5_500_000) {
+        console.warn('[Image Recognition] Image too large for inline API call, skipping vision step.');
+        return null;
+    }
+
+    const identificationPrompt = `You are a precise landmark and location identification AI.
+Analyze this image carefully and identify the EXACT place/landmark shown.
+
+Look for:
+- Architecture style (temple, palace, fort, church, mosque, etc.)
+- Visible signs, text, or inscriptions in the image
+- Distinctive structural features (gopuram, dome, minaret, monument, etc.)
+- Landscape and surroundings
+- Cultural and regional characteristics
+- Known world tourist landmarks
+
+${userHint ? `User hint: "${userHint}"` : ''}
+
+IMPORTANT RULES:
+- Be SPECIFIC. Do NOT guess a generic city or region if you can identify the specific landmark.
+- Example: If the image shows Taj Mahal, say "Taj Mahal" NOT just "Agra".
+- Example: If the image shows Chamundeshwari Temple, say "Chamundeshwari Temple" NOT just "Mysore".
+- If you truly cannot identify the specific landmark, still return your best guess with a lower confidence.
+- Never invent or hallucinate landmark names.
+
+Respond ONLY in this exact JSON format (no markdown backticks):
+{
+  "identifiedPlace": "Taj Mahal",
+  "city": "Agra",
+  "state": "Uttar Pradesh",
+  "country": "India",
+  "confidence": 0.99,
+  "category": "Monument",
+  "reason": "Iconic white marble mausoleum with central dome and four minarets, unmistakably the Taj Mahal"
+}`;
+
+    // Try model names in order of preference — gemini-flash-latest is confirmed working on this key
+    const modelCandidates = [
+        'gemini-flash-latest',
+        'gemini-2.0-flash',
+        'gemini-1.5-flash-latest',
+        'gemini-1.5-flash'
+    ];
+
+    for (const modelName of modelCandidates) {
+        try {
+            console.log(`[Image Recognition] Trying model: ${modelName}`);
+            const visionModel = genAI.getGenerativeModel({ model: modelName });
+
+            const result = await visionModel.generateContent([
+                identificationPrompt,
+                {
+                    inlineData: {
+                        data: base64Data,
+                        mimeType: resolvedMime
+                    }
+                }
+            ]);
+
+            let rawText = result.response.text().trim();
+            // Strip markdown code fences if model adds them
+            rawText = rawText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+
+            const parsed = JSON.parse(rawText);
+            console.log(`[Image Recognition] ✅ Model "${modelName}" identified: "${parsed.identifiedPlace}", ${parsed.city}, confidence: ${parsed.confidence}`);
+            return parsed;
+        } catch (e) {
+            console.error(`[Image Recognition] ❌ Model "${modelName}" failed: ${e.message}`);
+            // Continue to next candidate
+        }
+    }
+
+    console.error('[Image Recognition] All model candidates failed. Cannot identify landmark.');
+    return null;
+}
+
 router.post('/', async (req, res) => {
-    const { message, history } = req.body;
+    const { message, history, image, mimeType, imageUrl } = req.body;
     
     // Check if Gemini API is configured
     if (process.env.GEMINI_API_KEY) {
@@ -152,7 +239,7 @@ Format MUST exactly match this structure:
       "category": "nature",
       "rating": "4.6",
       "reviews": "10k+ reviews",
-      "description": "A historic botanical garden with a glasshouse and diverse plant species.",
+      "description": "Provide a very detailed, multi-paragraph description here. Give historical context, architectural details, cultural significance, and what makes it special. Do not use just one sentence. Write at least 3-4 sentences resembling a comprehensive travel guide description.",
       "image_url": "", 
       "image_gallery": [],
       "map_url": "https://maps.google.com/?q=Lalbagh+Botanical+Garden+Bangalore",
@@ -171,18 +258,133 @@ Format MUST exactly match this structure:
           "best_time": "Year-round",
           "image_url": ""
         }
-      ]
+      ],
+      "itinerary": [
+        {
+          "day": 1,
+          "title": "Arrival & City Tour",
+          "activities": [
+            "Morning: Arrive and settle in.",
+            "Afternoon: Visit the Lalbagh Botanical Garden.",
+            "Evening: Stroll around Cubbon Park and MG Road."
+          ]
+        },
+        {
+          "day": 2,
+          "title": "Heritage & Culture",
+          "activities": [
+            "Morning: Explore Bangalore Palace.",
+            "Afternoon: Lunch at a traditional South Indian restaurant.",
+            "Evening: Shopping at Commercial Street."
+          ]
+        }
+        }
+      ],
+      "packing_list": [
+        "Comfortable walking shoes",
+        "Sunscreen and sunglasses",
+        "Light cotton clothes",
+        "Water bottle"
+      ],
+      "budget_breakdown": {
+        "transport": 25,
+        "hotel": 35,
+        "food": 25,
+        "activities": 15
+      }
     }
   ]
 }`;
 
             const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY.trim());
-            
-            // Hardcode to gemini-flash-latest as 1.5 is returning 404 and 2.0 has quota issues
             const targetModel = "gemini-flash-latest";
             const model = genAI.getGenerativeModel({ model: targetModel });
 
-            const fullMessage = `${systemPrompt}\n\nCHAT HISTORY:\n${history || 'No previous history.'}\n\nUSER MESSAGE:\n${message}`;
+            // =========================================================
+            // STEP 1: IMAGE ANALYSIS — Identify the actual landmark FIRST
+            // Only runs when the user uploads an image or passes an image URL.
+            // =========================================================
+            let imageRecognition = null;
+            let imageAnalysisContext = '';
+
+            const hasImage = !!(image && image.length > 100); // base64 image from upload
+
+            if (hasImage) {
+                console.log('[Image Recognition] Image detected. Identifying landmark BEFORE generating tourism info...');
+
+                // Extract any user-provided text hint (e.g. "this is Udupi" or "explore this temple")
+                const userHint = message && message.trim() ? message.trim() : '';
+
+                imageRecognition = await identifyLandmarkFromImage(genAI, image, mimeType, userHint);
+
+                if (imageRecognition && typeof imageRecognition.confidence === 'number' && imageRecognition.confidence < 0.6) {
+                    // Low confidence — do NOT guess. Ask the user to confirm.
+                    console.log(`[Image Recognition] Low confidence (${imageRecognition.confidence}). Asking user to confirm.`);
+                    return res.json({
+                        reply: `🔍 I analyzed the image and this looks like it could be **${imageRecognition.identifiedPlace}** in ${imageRecognition.city || 'an unknown location'}, but I'm not fully certain (confidence: ${Math.round(imageRecognition.confidence * 100)}%).\n\nWould you like me to show tourism details for **${imageRecognition.identifiedPlace}**? Or could you tell me the place name so I can give you accurate information?`,
+                        action: 'IMAGE_UNCONFIRMED',
+                        image_recognition: imageRecognition,
+                        dynamic_chips: [
+                            `🗺️ Yes, show ${imageRecognition.identifiedPlace}`,
+                            `📍 Tell me the place name`,
+                            `🏛️ Search by name instead`,
+                            `📸 Upload a clearer image`,
+                            `🌏 Browse destinations`
+                        ],
+                        travel_cards: []
+                    });
+                }
+
+                if (!imageRecognition || !imageRecognition.identifiedPlace) {
+                    // Complete failure — cannot identify.
+                    console.log('[Image Recognition] Could not identify place from image.');
+                    return res.json({
+                        reply: `🔍 I couldn't confidently identify this place from the image. Please upload a clearer image or tell me the place name so I can find the best tourism information for you!`,
+                        action: 'IMAGE_UNIDENTIFIED',
+                        dynamic_chips: [
+                            `📷 Upload a clearer image`,
+                            `🔤 Type the place name`,
+                            `🏛️ Historical Places`,
+                            `🏖️ Beaches`,
+                            `🌄 Hill Stations`
+                        ],
+                        travel_cards: []
+                    });
+                }
+
+                // ✅ High confidence identification succeeded
+                // Build context so the tourism prompt focuses on the IDENTIFIED place
+                imageAnalysisContext = `
+IMAGE RECOGNITION RESULT (HIGH PRIORITY - DO NOT IGNORE):
+The user uploaded an image. The AI Vision system has identified the following landmark:
+- Place: ${imageRecognition.identifiedPlace}
+- City: ${imageRecognition.city || 'Unknown'}
+- State: ${imageRecognition.state || 'Unknown'}
+- Country: ${imageRecognition.country || 'India'}
+- Category: ${imageRecognition.category || 'tourist place'}
+- Confidence: ${Math.round((imageRecognition.confidence || 1) * 100)}%
+- Reason: ${imageRecognition.reason || 'Visual identification'}
+
+CRITICAL INSTRUCTION:
+You MUST generate tourism information for "${imageRecognition.identifiedPlace}" in ${imageRecognition.city || ''}, ${imageRecognition.state || ''}.
+Do NOT use any other destination from the chat history.
+Do NOT substitute a different landmark even if the city is familiar.
+The extracted_constraints.destination MUST be set to "${imageRecognition.identifiedPlace}".
+The travel_card place_name MUST be "${imageRecognition.identifiedPlace}".
+All nearby_places and recommendations MUST be genuinely near ${imageRecognition.identifiedPlace} in ${imageRecognition.city || ''}.`;
+
+                console.log(`[Image Recognition] ✅ Identified: ${imageRecognition.identifiedPlace}, ${imageRecognition.city}. Generating tourism info...`);
+            }
+
+            // =========================================================
+            // STEP 2: GENERATE TOURISM RESPONSE
+            // Uses identified place context if image was provided.
+            // =========================================================
+            const userMessageForAI = imageRecognition
+                ? `The user uploaded an image. The identified place is: ${imageRecognition.identifiedPlace}, ${imageRecognition.city}, ${imageRecognition.state}. ${message ? `User also said: "${message}"` : 'Please provide complete tourism information for this identified place.'}`
+                : (message || 'Tell me about this place.');
+
+            const fullMessage = `${systemPrompt}\n\n${imageAnalysisContext}\n\nCHAT HISTORY:\n${history || 'No previous history.'}\n\nUSER MESSAGE:\n${userMessageForAI}`;
             const result = await model.generateContent(fullMessage);
             
             let rawText = result.response.text();
@@ -231,6 +433,10 @@ Format MUST exactly match this structure:
                                 placeNameForImage = `${placeNameForImage} ${cityContext}`;
                             }
                             
+                            // Fix: topAttractions was undefined — use card's own top_attractions array
+                            const topAttractions = Array.isArray(card.top_attractions)
+                                ? card.top_attractions.map(a => (typeof a === 'string' ? a : a.name || ''))
+                                : [];
                             const realImage = await resolveDestinationImage(placeNameForImage, topAttractions);
                             card.image_url = realImage.image_url;
                             card.image_gallery = realImage.image_gallery;
@@ -293,7 +499,9 @@ Format MUST exactly match this structure:
                 return res.json({
                     reply: finalAiReply,
                     action: aiResult.action,
-                    travel_cards: aiResult.travel_cards || []
+                    travel_cards: aiResult.travel_cards || [],
+                    dynamic_chips: aiResult.dynamic_chips || [],
+                    image_recognition: imageRecognition || null
                 });
             }
         } catch (err) {

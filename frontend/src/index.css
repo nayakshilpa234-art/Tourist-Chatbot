@@ -811,3 +811,15 @@ html.light-mode .uninvert,
 html.light-mode [style*="background-image"] {
   filter: invert(1) hue-rotate(180deg);
 }
+
+/* Bounce animation for image analysis loading dots */
+@keyframes bounce {
+  0%, 80%, 100% {
+    transform: scale(0.6);
+    opacity: 0.5;
+  }
+  40% {
+    transform: scale(1.2);
+    opacity: 1;
+  }
+}

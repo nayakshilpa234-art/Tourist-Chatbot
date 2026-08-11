@@ -13,6 +13,27 @@ import EmergencyButton from './EmergencyButton';
 import EmergencyModal from './EmergencyModal';
 import FeedbackModal from './FeedbackModal';
 
+// Client-side guaranteed image fallback
+const resolveClientImage = (imgUrl, name, cat) => {
+    if (imgUrl) return imgUrl;
+    const n = (name || '').toLowerCase();
+    const c = (cat || '').toLowerCase();
+    if (n.includes('temple') || n.includes('matha') || n.includes('mandir') || c.includes('temple') || c.includes('religious'))
+        return 'https://images.unsplash.com/photo-1621841315750-bd1865a7f98c?q=80&w=1280';
+    if (n.includes('beach') || n.includes('island') || c.includes('beach'))
+        return 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?q=80&w=1280';
+    if (n.includes('hill') || n.includes('mountain') || n.includes('falls') || c.includes('hill') || c.includes('nature'))
+        return 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?q=80&w=1280';
+    if (n.includes('fort') || n.includes('palace') || n.includes('museum') || c.includes('historical'))
+        return 'https://images.unsplash.com/photo-1585136195228-568eb406cbbf?q=80&w=1280';
+    if (n.includes('garden') || n.includes('park') || n.includes('lake'))
+        return 'https://images.unsplash.com/photo-1585320806297-9794b3e4abb4?q=80&w=1280';
+    if (n.includes('udupi') || n.includes('karnataka') || n.includes('mangalore'))
+        return 'https://images.unsplash.com/photo-1582510003544-4d00b7f74220?q=80&w=1280';
+    return 'https://images.unsplash.com/photo-1524492412937-b28074a5d7da?q=80&w=1280'; // India generic
+};
+
+
 const Chatbot = ({ addToCart }) => {
     const [messages, setMessages] = useState([
         { text: "Hi! I'm your AI Tourist Assistant. Looking for a beach, mountain, or historical destination? Or do you want to book a trip?", sender: 'bot' }
@@ -809,11 +830,8 @@ const Chatbot = ({ addToCart }) => {
             const transcript = voiceTranscriptRef.current.trim();
             voiceTranscriptRef.current = '';
             if (transcript) {
-                setInput(transcript);
-                try {
-                    const el = document.querySelector('.chat-input input');
-                    if (el) { el.focus(); }
-                } catch (e) {}
+                setInput('');
+                handleSend(transcript);
             }
         };
 
@@ -839,7 +857,7 @@ const Chatbot = ({ addToCart }) => {
                 if (recognitionRetryRef.current >= 3) {
                     recognitionRetryRef.current = 0;
                     resetMicState();
-                    showMicError('Voice recognition unavailable. Make sure you are using Chrome/Edge and are connected to the internet.');
+                    showMicError('Voice recognition blocked by browser. If using Brave, enable "Web Speech API" in Settings, or use Chrome/Edge.');
                 }
                 // else: silently let onend handle the restart
                 return;
@@ -1006,8 +1024,8 @@ const Chatbot = ({ addToCart }) => {
         reader.readAsDataURL(file);
     };
 
-    const handleSend = async (overrideMessage = null) => {
-        const draft = overrideMessage !== null ? overrideMessage : input;
+    const handleSend = async (overrideMessage = null, opts = {}) => {
+        const draft = typeof overrideMessage === 'string' ? overrideMessage : input;
         if (!draft.trim() && !selectedImage) return; // Allow sending just image
         if (isSending) return;
         setIsSending(true);
@@ -1015,13 +1033,37 @@ const Chatbot = ({ addToCart }) => {
         const userMsg = draft;
         const currentImage = selectedImage;
         const currentMimeType = imageMimeType;
+        // Optional image URL context passed from nearby/card explore buttons
+        const cardImageUrl = opts.imageUrl || null;
         
         setInput('');
+        voiceTranscriptRef.current = '';
         setSelectedImage(null);
         setImageMimeType(null);
         if (fileInputRef.current) fileInputRef.current.value = '';
 
+        // Stop listening if sending manually while mic is active
+        if (isListeningRef.current || isMicStarting) {
+            isListeningRef.current = false;
+            setIsListening(false);
+            setIsMicStarting(false);
+            if (recognitionRef.current) {
+                try { recognitionRef.current.stop(); } catch (_) {}
+                recognitionRef.current = null;
+            }
+        }
+
+
         setMessages(prev => [...prev, { text: userMsg, sender: 'user', image: currentImage }]);
+
+        // Show immediate "Analyzing image..." indicator when an image is present
+        if (currentImage) {
+            setMessages(prev => [...prev, {
+                text: '🔍 Analyzing image to identify the exact landmark... Please wait.',
+                sender: 'bot',
+                isAnalyzing: true
+            }]);
+        }
 
         const tokenStr = localStorage.getItem('token');
         const config = (tokenStr && tokenStr !== 'null') ? { headers: { Authorization: `Bearer ${tokenStr}` } } : {};
@@ -1046,7 +1088,16 @@ const Chatbot = ({ addToCart }) => {
                 payload.image = currentImage;
                 payload.mimeType = currentMimeType;
             }
+            // Pass card image URL as a hint when user taps Explore on a nearby card
+            if (cardImageUrl && !currentImage) {
+                payload.imageUrl = cardImageUrl;
+            }
             const res = await axios.post('/api/chat', payload, config);
+
+            // Remove the "Analyzing image..." temporary message before adding real response
+            if (currentImage) {
+                setMessages(prev => prev.filter(m => !m.isAnalyzing));
+            }
 
             const botMsg = { 
                 text: res.data.reply, 
@@ -1059,7 +1110,8 @@ const Chatbot = ({ addToCart }) => {
                 preview_card: res.data.preview_card || null,
                 full_destination: res.data.full_destination || null,
                 google_maps: res.data.google_maps || null,
-                showTrips: res.data.action === 'SHOW_TRIPS' 
+                showTrips: res.data.action === 'SHOW_TRIPS',
+                image_recognition: res.data.image_recognition || null
             };
             
             if (res.data.dynamic_chips && Array.isArray(res.data.dynamic_chips) && res.data.dynamic_chips.length > 0) {
@@ -1077,11 +1129,16 @@ const Chatbot = ({ addToCart }) => {
             }
 
         } catch (err) {
+            // Remove "Analyzing image..." on error too
+            if (currentImage) {
+                setMessages(prev => prev.filter(m => !m.isAnalyzing));
+            }
             setMessages(prev => [...prev, { text: 'Sorry, I am having trouble connecting to the server.', sender: 'bot' }]);
         } finally {
             setIsSending(false);
         }
     };
+
 
         const callEmergency = async (query, opts = {}) => {
             try {
@@ -1975,8 +2032,8 @@ const Chatbot = ({ addToCart }) => {
                         setDetailPage({
                             ...baseObj,
                             place_name: baseObj.place_name || title,
-                            image_url: dest.image_url || dest.imageUrl,
-                            image_gallery: Array.isArray(dest.image_gallery) ? dest.image_gallery : [dest.image_url || dest.imageUrl],
+                            image_url: resolveClientImage(dest.image_url || dest.imageUrl, title, category),
+                            image_gallery: Array.isArray(dest.image_gallery) && dest.image_gallery.length > 0 ? dest.image_gallery : [resolveClientImage(dest.image_url || dest.imageUrl, title, category)],
                             distance: dest.distance || baseObj.distance || 'Varies',
                             attractions: Array.isArray(dest.top_attractions) ? dest.top_attractions.map(a => typeof a === 'string' ? {name: a} : a) : (Array.isArray(dest.attractions) ? dest.attractions : (baseObj.attractions || [])),
                             travel_tips: Array.isArray(dest.travel_tips) ? dest.travel_tips : (baseObj.travel_tips || []),
@@ -2074,7 +2131,7 @@ const Chatbot = ({ addToCart }) => {
                                                         style={{ width: '100%', padding: '8px', fontSize: '13px', borderRadius: '8px', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', color: '#10b981', cursor: 'pointer', transition: 'all 0.2s' }}
                                                         onMouseEnter={e => { e.currentTarget.style.background = 'rgba(16,185,129,0.2)' }}
                                                         onMouseLeave={e => { e.currentTarget.style.background = 'rgba(16,185,129,0.1)' }}
-                                                        onClick={() => handleSend(np.name)}
+                                                        onClick={() => handleSend(`Tell me about ${np.name}`, { imageUrl: np.image_url || np.imageUrl || null })}
                                                     >
                                                         Explore
                                                     </button>
@@ -2097,7 +2154,40 @@ const Chatbot = ({ addToCart }) => {
                         </button>
                         
                         <div style={{ position: 'relative', borderRadius: '15px', overflow: 'hidden', height: '300px', marginBottom: '20px', background: 'linear-gradient(135deg, #1e1b4b 0%, #312e81 100%)' }}>
-                            <img src={detailPage.image_url} alt={detailPage.place_name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                            {detailPage.image_url ? (
+                                <img
+                                    src={detailPage.image_url}
+                                    alt={detailPage.place_name}
+                                    style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                    onError={(e) => {
+                                        // Try category-based Unsplash fallback based on place name / category
+                                        const name = (detailPage.place_name || '').toLowerCase();
+                                        const cat  = (detailPage.category || '').toLowerCase();
+                                        let fallback = 'https://images.unsplash.com/photo-1524492412937-b28074a5d7da?q=80&w=1280'; // India generic
+                                        if (name.includes('temple') || name.includes('matha') || name.includes('mandir') || cat.includes('temple') || cat.includes('religious')) {
+                                            fallback = 'https://images.unsplash.com/photo-1621841315750-bd1865a7f98c?q=80&w=1280';
+                                        } else if (name.includes('beach') || name.includes('island') || cat.includes('beach')) {
+                                            fallback = 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?q=80&w=1280';
+                                        } else if (name.includes('hill') || name.includes('peak') || name.includes('mountain') || name.includes('falls') || cat.includes('hill') || cat.includes('nature')) {
+                                            fallback = 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?q=80&w=1280';
+                                        } else if (name.includes('fort') || name.includes('palace') || name.includes('museum') || cat.includes('historical') || cat.includes('monument')) {
+                                            fallback = 'https://images.unsplash.com/photo-1585136195228-568eb406cbbf?q=80&w=1280';
+                                        } else if (name.includes('garden') || name.includes('park') || cat.includes('garden')) {
+                                            fallback = 'https://images.unsplash.com/photo-1585320806297-9794b3e4abb4?q=80&w=1280';
+                                        }
+                                        if (e.target.src !== fallback) {
+                                            e.target.src = fallback;
+                                        } else {
+                                            // If even the fallback fails, hide the img entirely
+                                            e.target.style.display = 'none';
+                                        }
+                                    }}
+                                />
+                            ) : (
+                                <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '80px', opacity: 0.4 }}>
+                                    🏛️
+                                </div>
+                            )}
                             <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'linear-gradient(transparent, rgba(0,0,0,0.8))', padding: '20px' }}>
                                 <h2 style={{ margin: 0, fontSize: '32px', color: 'white' }}>{detailPage.place_name}</h2>
                                 <p style={{ margin: '5px 0 0 0', display: 'flex', alignItems: 'center', gap: '5px', color: 'var(--accent)' }}><MapPin size={18}/> {detailPage.location}</p>
@@ -2142,7 +2232,21 @@ const Chatbot = ({ addToCart }) => {
                                     <div key={i} style={{ background: 'rgba(255,255,255,0.04)', borderRadius: '12px', padding: '14px', border: '1px solid rgba(255,255,255,0.06)' }}>
                                         <div style={{ fontSize: '22px', marginBottom: '6px' }}>{item.icon}</div>
                                         <div style={{ fontSize: '11px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>{item.label}</div>
-                                        <div style={{ fontSize: '13px', fontWeight: '600', color: 'var(--text-main)' }}>{item.value}</div>
+                                        <div style={{ fontSize: '13px', fontWeight: '600', color: 'var(--text-main)' }}>
+                                            {item.label === 'Distance' && routeData ? (
+                                                routeData.calculating ? 'Calculating...' :
+                                                routeData.error ? <span style={{ color: '#ef4444' }}>{routeData.error}</span> :
+                                                <span style={{ color: '#10b981' }}>{routeData.distance} km ({routeData.time} hrs)</span>
+                                            ) : item.value}
+                                        </div>
+                                        {item.label === 'Distance' && !routeData && originCity && realtimeData && (
+                                            <button 
+                                                onClick={calculateDistance}
+                                                style={{ marginTop: '8px', padding: '4px 8px', fontSize: '11px', background: 'var(--accent)', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', width: '100%' }}
+                                            >
+                                                Calculate Live Distance
+                                            </button>
+                                        )}
                                     </div>
                                 ))}
                             </div>
@@ -2262,6 +2366,49 @@ const Chatbot = ({ addToCart }) => {
                                         );
                                     })}
                                 </div>
+                            </div>
+                        )}
+
+                        {/* Packing List & Budget Breakdown */}
+                        {(detailPage.packing_list?.length > 0 || detailPage.budget_breakdown) && (
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '20px', marginBottom: '30px' }}>
+                                {/* Packing List */}
+                                {detailPage.packing_list?.length > 0 && (
+                                    <div className="glass-panel" style={{ padding: '20px', background: 'rgba(255,255,255,0.02)' }}>
+                                        <h4 style={{ margin: '0 0 15px 0', display: 'flex', alignItems: 'center', gap: '8px', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '10px' }}>
+                                            🧳 Smart Packing List
+                                        </h4>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                            {detailPage.packing_list.map((item, idx) => (
+                                                <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                                                    <div style={{ width: '16px', height: '16px', background: 'white', borderRadius: '4px' }}></div>
+                                                    <span style={{ color: 'var(--text-main)', fontSize: '14px' }}>{item}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+                                {/* Budget Breakdown */}
+                                {detailPage.budget_breakdown && (
+                                    <div className="glass-panel" style={{ padding: '20px', background: 'rgba(255,255,255,0.02)' }}>
+                                        <h4 style={{ margin: '0 0 15px 0', display: 'flex', alignItems: 'center', gap: '8px', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '10px' }}>
+                                            📊 Budget Breakdown
+                                        </h4>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
+                                            {Object.entries(detailPage.budget_breakdown).map(([key, value], idx) => (
+                                                <div key={idx}>
+                                                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '5px', fontSize: '14px', textTransform: 'capitalize', color: 'var(--text-main)' }}>
+                                                        <span>{key}</span>
+                                                        <span style={{ color: '#10b981', fontWeight: 'bold' }}>{value}%</span>
+                                                    </div>
+                                                    <div style={{ width: '100%', height: '6px', background: 'rgba(255,255,255,0.1)', borderRadius: '3px', overflow: 'hidden' }}>
+                                                        <div style={{ width: `${value}%`, height: '100%', background: '#10b981', borderRadius: '3px' }}></div>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         )}
 
@@ -2390,23 +2537,22 @@ const Chatbot = ({ addToCart }) => {
                             </div>
                         </div>
 
-                        {detailPage.itinerary && detailPage.itinerary.length > 0 && (
-                            <div style={{ marginBottom: '30px', padding: '20px', background: 'rgba(0,0,0,0.2)', borderRadius: '15px', border: '1px solid var(--border)' }}>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-                                    <h4 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: '8px', fontSize: '18px' }}>
-                                        🗓️ Suggested Day-wise Itinerary
-                                    </h4>
-                                </div>
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '15px' }}>
-                                    {detailPage.itinerary.map((dayPlan, i) => (
-                                        <div key={i} style={{ padding: '15px', background: 'rgba(255,255,255,0.02)', borderRadius: '8px', borderLeft: '3px solid var(--accent)' }}>
-                                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                                                <strong style={{ color: 'var(--accent)', fontSize: '15px' }}>Day {dayPlan.day}</strong>
-                                                <span style={{ fontSize: '14px', fontWeight: 'bold', color: 'var(--text-main)' }}>{dayPlan.title}</span>
+                        {/* Related / Nearby Places */}
+                        {detailPage.nearby_places && Array.isArray(detailPage.nearby_places) && detailPage.nearby_places.length > 0 && (
+                            <div className="glass-panel" style={{ padding: '20px', marginBottom: '30px', background: 'rgba(255,255,255,0.02)' }}>
+                                <h4 style={{ margin: '0 0 15px 0', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '10px' }}>📍 Related Nearby Places</h4>
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '20px' }}>
+                                    {detailPage.nearby_places.map((np, i) => (
+                                        <div key={i} style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '12px', padding: '15px', border: '1px solid rgba(255,255,255,0.05)', display: 'flex', flexDirection: 'column' }}>
+                                            <h5 style={{ margin: '0 0 8px 0', fontSize: '16px', color: 'white' }}>{np.name}</h5>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px', color: 'var(--accent)', marginBottom: '10px' }}>
+                                                <span>📍 {np.distance}</span>
+                                                <span>⭐ {np.rating}</span>
                                             </div>
-                                            <ul style={{ margin: 0, paddingLeft: '20px', fontSize: '15px', color: 'var(--text-muted)', lineHeight: '1.6' }}>
-                                                {dayPlan.activities?.map((act, idx) => <li key={idx} style={{ marginBottom: '8px' }}>{act}</li>)}
-                                            </ul>
+                                            <p style={{ margin: '0 0 12px 0', fontSize: '13px', color: 'var(--text-muted)', lineHeight: '1.5', flexGrow: 1 }}>{np.description}</p>
+                                            <div style={{ fontSize: '12px', color: 'rgba(255,255,255,0.6)' }}>
+                                                🗓️ Best Time: {np.best_time}
+                                            </div>
                                         </div>
                                     ))}
                                 </div>
@@ -2855,7 +3001,52 @@ const Chatbot = ({ addToCart }) => {
                 <div className="chat-messages">
                 {messages.map((msg, i) => (
                     <motion.div key={i} className={`message ${msg.sender}`} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
-                        <p style={{ whiteSpace: 'pre-line' }}>{msg.text}</p>
+                        {msg.isAnalyzing ? (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '4px 0' }}>
+                                <div style={{ display: 'flex', gap: '5px', alignItems: 'center' }}>
+                                    {[0, 1, 2].map(d => (
+                                        <div key={d} style={{
+                                            width: '8px', height: '8px', borderRadius: '50%',
+                                            background: 'linear-gradient(135deg, #10b981, #3b82f6)',
+                                            animation: `bounce 1.2s ease-in-out ${d * 0.2}s infinite`
+                                        }} />
+                                    ))}
+                                </div>
+                                <span style={{ color: '#10b981', fontSize: '14px', fontWeight: '600' }}>
+                                    🔍 Analyzing image to identify the exact landmark...
+                                </span>
+                            </div>
+                        ) : (
+                            <>
+                                {/* Image Recognition Badge — shown when a place was identified from an image */}
+                                {msg.image_recognition && msg.image_recognition.identifiedPlace && (
+                                    <div style={{
+                                        display: 'flex', alignItems: 'center', gap: '10px',
+                                        background: 'linear-gradient(135deg, rgba(16,185,129,0.12), rgba(59,130,246,0.10))',
+                                        border: '1px solid rgba(16,185,129,0.3)',
+                                        borderRadius: '10px', padding: '10px 14px',
+                                        marginBottom: '10px', flexWrap: 'wrap'
+                                    }}>
+                                        <span style={{ fontSize: '18px' }}>🔍</span>
+                                        <div>
+                                            <div style={{ fontSize: '13px', color: '#10b981', fontWeight: '700' }}>
+                                                Image Identified:
+                                            </div>
+                                            <div style={{ fontSize: '14px', color: 'white', fontWeight: '600' }}>
+                                                📍 {msg.image_recognition.identifiedPlace}
+                                                {msg.image_recognition.city ? `, ${msg.image_recognition.city}` : ''}
+                                                {msg.image_recognition.state ? `, ${msg.image_recognition.state}` : ''}
+                                            </div>
+                                            <div style={{ fontSize: '11px', color: 'rgba(255,255,255,0.5)', marginTop: '2px' }}>
+                                                {msg.image_recognition.category && `${msg.image_recognition.category} · `}
+                                                Confidence: {Math.round((msg.image_recognition.confidence || 0) * 100)}%
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                                <p style={{ whiteSpace: 'pre-line' }}>{msg.text}</p>
+                            </>
+                        )}
                         {msg.image && (
                             <div style={{ marginTop: '10px' }}>
                                 <img src={msg.image} alt="Uploaded" style={{ maxWidth: '100%', maxHeight: '200px', borderRadius: '8px' }} />
@@ -3035,24 +3226,32 @@ const Chatbot = ({ addToCart }) => {
 
                                     const handleExploreMore = () => {
                                         const fullDest = msg.full_destination || card;
+
+
+                                        const placeName = fullDest.place_name || title;
+                                        const placeCategory = fullDest.category || category;
+                                        const resolvedImage = resolveClientImage(fullDest.image_url || card.image_url, placeName, placeCategory);
+
                                         setDetailPage({
-                                            place_name: fullDest.place_name || title,
+                                            place_name: placeName,
                                             location: fullDest.location || location,
-                                            category: fullDest.category || category,
+                                            category: placeCategory,
                                             description: fullDest.description || card.description,
-                                            image_url: fullDest.image_url || card.image_url,
-                                            image_gallery: Array.isArray(fullDest.image_gallery) ? fullDest.image_gallery : (card.image_gallery || [card.image_url]),
+                                            image_url: resolvedImage,
+                                            image_gallery: Array.isArray(fullDest.image_gallery) && fullDest.image_gallery.length > 0
+                                                ? fullDest.image_gallery
+                                                : (card.image_gallery && card.image_gallery.length > 0 ? card.image_gallery : [resolvedImage]),
                                             best_time: fullDest.best_time || bestTime,
                                             weather: fullDest.weather || card.weather,
                                             distance: fullDest.distance || card.distance,
                                             price: fullDest.price || card.price,
                                             rating: fullDest.rating || rating,
                                             entry_fee: fullDest.entry_fee || 'Varies',
-                                            map_url: fullDest.map_url || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(title)}`,
+                                            map_url: fullDest.map_url || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(placeName)}`,
                                             hotels: fullDest.hotels || [],
                                             foods: fullDest.foods || [],
                                             nearby_attractions: fullDest.nearby_attractions || card.nearby_attractions || [],
-                                            tags: fullDest.tags || [category],
+                                            tags: fullDest.tags || [placeCategory],
                                             budgets: fullDest.budgets || card.budgets,
                                             itinerary: fullDest.itinerary || [],
                                             itinerary_1_day: fullDest.itinerary_1_day || [],
@@ -3074,7 +3273,22 @@ const Chatbot = ({ addToCart }) => {
                                             {/* Hero Image */}
                                             {imageUrl && (
                                                 <div style={{ width: '100%', height: '220px', borderRadius: '12px', overflow: 'hidden', position: 'relative' }}>
-                                                    <img src={imageUrl} alt={title} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                                                    <img
+                                                        src={imageUrl}
+                                                        alt={title}
+                                                        style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                                                        onError={(e) => {
+                                                            const n = (title || '').toLowerCase();
+                                                            const c = (category || '').toLowerCase();
+                                                            let fb = 'https://images.unsplash.com/photo-1524492412937-b28074a5d7da?q=80&w=1280';
+                                                            if (n.includes('temple') || n.includes('matha') || n.includes('mandir') || c.includes('temple')) fb = 'https://images.unsplash.com/photo-1621841315750-bd1865a7f98c?q=80&w=1280';
+                                                            else if (n.includes('beach') || n.includes('island') || c.includes('beach')) fb = 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?q=80&w=1280';
+                                                            else if (n.includes('hill') || n.includes('mountain') || n.includes('falls') || c.includes('hill')) fb = 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?q=80&w=1280';
+                                                            else if (n.includes('fort') || n.includes('palace') || c.includes('historical')) fb = 'https://images.unsplash.com/photo-1585136195228-568eb406cbbf?q=80&w=1280';
+                                                            if (e.target.src !== fb) e.target.src = fb;
+                                                            else e.target.style.display = 'none';
+                                                        }}
+                                                    />
                                                     <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'linear-gradient(transparent, rgba(0,0,0,0.8))', padding: '15px' }}>
                                                         <h3 style={{ margin: 0, fontSize: '28px', fontWeight: '800', color: 'white' }}>{title}</h3>
                                                         <p style={{ margin: '5px 0 0 0', display: 'flex', alignItems: 'center', gap: '5px', color: 'var(--accent)', fontSize: '14px' }}><MapPin size={16}/> {location}</p>

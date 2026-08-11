@@ -1,136 +1,100 @@
-/**
- * Strictly Curated Destination Image Database
- * We NEVER use generic/random image APIs or placeholders. We only serve highly verified photos of the actual destination.
+﻿/**
+ * Destination Image Service
+ * Uses verified Unsplash CDN URLs. No Wikimedia API calls (browser hotlinking blocked).
+ * Guarantees image_url is ALWAYS non-null.
  */
 
-const axios = require('axios');
-
-// In-memory cache to store resolved image results and improve speed
 const imageCache = new Map();
-
-// Clean location names
-function sanitizeLocationName(name) {
-    if (!name) return 'india';
-    let safeName = name.split('(')[0];
-    safeName = safeName.split(',')[0].trim().toLowerCase();
-    return safeName;
-}
-
 const imageDatabase = require('./imageDatabase');
 
-/**
- * Fetch real images dynamically from Wikimedia Commons
- */
-async function fetchCommonsImages(query, limit = 5) {
-    try {
-        const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrnamespace=6&gsrlimit=${limit}&prop=imageinfo&iiprop=url&format=json`;
-        const res = await axios.get(url, { 
-            timeout: 8000,
-            headers: { 'User-Agent': 'AITouristAssistant/1.0 (contact@example.com)' }
-        });
-        
-        if (res.data && res.data.query && res.data.query.pages) {
-            const pages = res.data.query.pages;
-            const images = Object.values(pages)
-                .map(page => page.imageinfo && page.imageinfo[0] ? page.imageinfo[0].url : null)
-                .filter(url => url !== null && !url.toLowerCase().endsWith('.svg') && !url.toLowerCase().endsWith('.gif')); // filter out svgs/gifs
-            return images;
-        }
-    } catch(e) {
-        console.error(`Wikimedia fetch failed for query "${query}":`, e.message);
-    }
-    return [];
+function sanitizeLocationName(name) {
+    if (!name) return 'india';
+    let s = name.split('(')[0];
+    s = s.split(',')[0].trim().toLowerCase();
+    return s;
 }
 
-/**
- * Resolves the best possible real photograph for a destination.
- * Priorities: 1) Static Local DB 2) Cache 3) Dynamic Wikimedia Commons fetch 4) Category Fallback
- */
-async function resolveDestinationImage(placeName, attractions = []) {
-    const safeName = sanitizeLocationName(placeName);
-    const formattedName = safeName.charAt(0).toUpperCase() + safeName.slice(1);
-    
-    let allImages = new Set();
-    let heroImage = null;
+function getCategoryFallback(name, category) {
+    const n = (name || '').toLowerCase();
+    const c = (category || '').toLowerCase();
+    if (n.includes('beach') || n.includes('island') || c.includes('beach') || c.includes('coastal'))
+        return imageDatabase['default_beach'];
+    if (n.includes('hill') || n.includes('peak') || n.includes('mountain') || n.includes('falls') || n.includes('waterfall') || c.includes('hill') || c.includes('nature') || c.includes('trek'))
+        return imageDatabase['default_mountain'];
+    if (n.includes('temple') || n.includes('matha') || n.includes('mandir') || n.includes('mosque') || n.includes('church') || n.includes('shrine') || c.includes('temple') || c.includes('religious') || c.includes('spiritual'))
+        return imageDatabase['default_temple'];
+    if (n.includes('fort') || n.includes('palace') || n.includes('museum') || n.includes('ruins') || c.includes('historical') || c.includes('heritage') || c.includes('monument'))
+        return imageDatabase['default_historical'];
+    if (n.includes('zoo') || n.includes('wildlife') || n.includes('national park') || n.includes('sanctuary') || c.includes('wildlife'))
+        return imageDatabase['default_wildlife'] || imageDatabase['default'];
+    if (n.includes('garden') || n.includes('park') || n.includes('lake') || n.includes('dam'))
+        return imageDatabase['default_mountain'];
+    return imageDatabase['default'];
+}
 
-    // 0. Static Database (Highest accuracy, instantaneous)
+async function resolveDestinationImage(placeName, attractions, category) {
+    attractions = attractions || [];
+    category = category || '';
+    const safeName = sanitizeLocationName(placeName);
+
+    const cacheKey = 'v3_' + safeName;
+    if (imageCache.has(cacheKey)) return imageCache.get(cacheKey);
+
+    let heroImage = null;
+    const galleryImages = new Set();
+
+    // 1. Exact DB match
     if (imageDatabase[safeName]) {
         heroImage = imageDatabase[safeName];
-        allImages.add(heroImage);
+        galleryImages.add(heroImage);
     }
-    
+
+    // 2. Partial match: place name contains a DB key, or vice-versa
+    if (!heroImage) {
+        const keys = Object.keys(imageDatabase).filter(k => !k.startsWith('default') && k !== 'default');
+        for (const key of keys) {
+            if (safeName.includes(key) || key.includes(safeName)) {
+                heroImage = imageDatabase[key];
+                galleryImages.add(heroImage);
+                console.log('[ImageService] Partial match: "' + safeName + '" matched key "' + key + '"');
+                break;
+            }
+        }
+    }
+
+    // 3. Attraction-based gallery
     for (const attr of attractions) {
         const safeAttr = sanitizeLocationName(attr);
         if (imageDatabase[safeAttr]) {
             if (!heroImage) heroImage = imageDatabase[safeAttr];
-            allImages.add(imageDatabase[safeAttr]);
+            galleryImages.add(imageDatabase[safeAttr]);
         }
     }
 
-    // Generate a unique cache key based on place and attractions
-    const cacheKey = `v2_${safeName}_${(attractions || []).join('_')}`.toLowerCase();
-
-    // 1. Check Cache
-    if (!heroImage && imageCache.has(cacheKey)) {
-        return imageCache.get(cacheKey);
+    // 4. Category keyword fallback
+    if (!heroImage) {
+        heroImage = getCategoryFallback(safeName, category);
+        galleryImages.add(heroImage);
+        console.log('[ImageService] Category fallback for "' + safeName + '": ' + heroImage);
     }
 
-    // 2. Try fetching the hero image from Network if not in static DB
-    if (!heroImage && attractions && attractions.length > 0) {
-        const heroQuery = `${formattedName} ${attractions[0]}`;
-        const heroResults = await fetchCommonsImages(heroQuery, 3);
-        if (heroResults.length > 0) {
-            heroImage = heroResults[0];
-            heroResults.forEach(img => allImages.add(img));
-        }
+    // 5. Absolute last resort
+    if (!heroImage) {
+        heroImage = imageDatabase['default'];
+        galleryImages.add(heroImage);
     }
 
-    // 3. Try fetching general destination images to fill the gallery
-    if (allImages.size < 4) {
-        const generalQuery = formattedName;
-        const generalResults = await fetchCommonsImages(generalQuery, 10);
-        generalResults.forEach(img => allImages.add(img));
-    }
-    
-    // 4. Try nearby/broad terms if we still don't have enough images
-    if (allImages.size < 4) {
-        const broadResults = await fetchCommonsImages(`${formattedName} nature OR city OR temple`, 5);
-        broadResults.forEach(img => allImages.add(img));
-    }
+    if (galleryImages.size === 0) galleryImages.add(heroImage);
 
-    const uniqueImages = Array.from(allImages);
-
-    // If hero image wasn't found, use the first general image
-    if (!heroImage && uniqueImages.length > 0) {
-        heroImage = uniqueImages[0];
-    }
-
-    // 5. Fallback: Category-based defaults instead of Udupi Temple
-    if (uniqueImages.length === 0) {
-        if (safeName.includes('beach') || safeName.includes('island')) {
-            heroImage = imageDatabase['default_beach'];
-        } else if (safeName.includes('hill') || safeName.includes('peak') || safeName.includes('mountain')) {
-            heroImage = imageDatabase['default_mountain'];
-        } else if (safeName.includes('temple') || safeName.includes('matha')) {
-            heroImage = imageDatabase['default_temple'];
-        } else {
-            heroImage = imageDatabase['default'];
-        }
-        uniqueImages.push(heroImage);
-    }
+    console.log('[ImageService] Resolved "' + placeName + '" -> ' + heroImage);
 
     const result = {
         image_url: heroImage,
-        image_gallery: uniqueImages.slice(0, 6) // Max 6 images
+        image_gallery: Array.from(galleryImages).slice(0, 6)
     };
 
-    // Cache the result
     imageCache.set(cacheKey, result);
-
     return result;
 }
 
-module.exports = {
-    resolveDestinationImage,
-    sanitizeLocationName
-};
+module.exports = { resolveDestinationImage, sanitizeLocationName };

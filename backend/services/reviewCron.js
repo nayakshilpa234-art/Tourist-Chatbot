@@ -2,6 +2,19 @@ const cron = require('node-cron');
 const nodemailer = require('nodemailer');
 const Booking = require('../models/Booking');
 const mongoose = require('mongoose');
+const os = require('os');
+
+function getLocalIp() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+                return iface.address;
+            }
+        }
+    }
+    return 'localhost';
+}
 
 function getMailTransporter() {
     return nodemailer.createTransport({
@@ -15,7 +28,9 @@ function getMailTransporter() {
 
 const sendReviewEmail = async (booking) => {
     const transporter = getMailTransporter();
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    // Default to local IP so phone on same WiFi can open it
+    const defaultUrl = `http://${getLocalIp()}:5173`;
+    const frontendUrl = process.env.FRONTEND_URL || defaultUrl;
     const reviewLink = `${frontendUrl}/review/${booking._id}`;
 
     const mailOptions = {
