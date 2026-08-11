@@ -1,6 +1,6 @@
 {
   "installCommand": "if [ -d \"frontend\" ]; then (cd backend && npm install --include=dev) && (cd frontend && npm install --include=dev); else npm install --include=dev; fi",
-  "buildCommand": "if [ -d \"frontend\" ]; then (cd frontend && npm run build) && cp -r frontend/dist ./dist; else npm run build; fi",
+  "buildCommand": "if [ -d \"frontend\" ]; then (cd frontend && npm run build) && mkdir -p dist && cp -r frontend/dist/* dist/; else npm run build; fi",
   "outputDirectory": "dist",
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api" },
