@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
+    "build": "echo 'No build required for backend'",
     "create-admin": "node createAdmin.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
